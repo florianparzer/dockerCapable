@@ -54,41 +54,44 @@ struct data_t{
     u32 pid;
     u32 uid;
     int cap;
-    int inEffective; //is 0 when cap is in effective set of task
+    //int inEffective; //is 0 when cap is in effective set of task; Not possible as function is not called via kretprobe
     char comm[TASK_COMM_LEN];
 };
 
 BPF_PERF_OUTPUT(events);
 
-BPF_HASH(isTraces, struct data_t);
+BPF_HASH(isTraces, struct data_t, int);
 
 int traceCap(struct pt_regs *ctx, const struct cred *cred, struct user_namespace *targ_ns,
     int cap, unsigned int opts){
+    //bpf_trace_printk("Cap: %d\\n", cap);
+    //return 0;
     struct data_t data = {};
     
     data.pid = bpf_get_current_pid_tgid();
     data.tgid = bpf_get_current_pid_tgid() >> 32;
     data.uid = bpf_get_current_uid_gid();
     data.cap = cap;
-    data.inEffective = PT_REGS_RC(ctx);
+    //data.inEffective = PT_REGS_RC(ctx);
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     
     if(isTraces.lookup(&data) != NULL){
         return 0;
     }
-    //isTraces.update(&data);
+    isTraces.update(&data, &cap);
     
     events.perf_submit(ctx, &data, sizeof(data));
     return 0;
 }
 '''
 b = BPF(text=prog)
-b.attach_kretprobe(event='cap_capable', fn_name='traceCap')
+#b.attach_kretprobe(event='cap_capable', fn_name='traceCap')
+b.attach_kprobe(event='cap_capable', fn_name='traceCap')
 
 def printCaps(ctx, data, size):
     event = b['events'].event(data)
-    inEffective = True if event.inEffective == 0 else False
-    print("%-16s %-6d %d %d %s, %r" % (event.comm, event.tgid, event.uid, event.cap, capabilities[event.cap], inEffective))
+    #inEffective = True if event.inEffective == 0 else False
+    print("%-16s %-6d %d %d %s" % (event.comm, event.tgid, event.uid, event.cap, capabilities[event.cap]))
 
 b['events'].open_perf_buffer(printCaps)
 while True:
