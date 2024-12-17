@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 from bcc import BPF
 from threading import Thread
+from threading import Event
 import queue
 import time
 
@@ -48,7 +49,7 @@ capabilities = {
     40: "CAP_CHECKPOINT_RESTORE",
 }
 
-def execsnoop(pidQueue):
+def execsnoop(pidQueue, runEvent):
     containerProcesses = []
     prog = '''
     #include <uapi/linux/ptrace.h> //needed? prob because of the task struct
@@ -95,15 +96,14 @@ def execsnoop(pidQueue):
             pidQueue.put(event.pid)
 
     execBPF['events'].open_perf_buffer(sendPID)
-    while True:
-        try:
-            execBPF.perf_buffer_poll()
-        except KeyboardInterrupt:
-            exit()
+    while runEvent.is_set():
+        execBPF.perf_buffer_poll()
 
-def capable(pidQueue):
+
+def capable(pidQueue, runEvent):
     #TODO Dictonary containing pid as key and a list of caps as value
     capablePIDs = {}
+    containerProcesses = set()
     prog = '''
     #include <linux/sched.h>
     //define the output struct
@@ -143,30 +143,46 @@ def capable(pidQueue):
     }
     '''
     capableBPF = BPF(text=prog)
-    print('test1')
     capableBPF.attach_kprobe(event='cap_capable', fn_name='traceCap')
 
     def traceCaps(ctx, data, size):
         event = capableBPF['events'].event(data)
-        if event.pid not in capablePIDs:
-            capablePIDs[event.pid] = {event.cap}
-        else:
-            capablePIDs[event.pid] = capablePIDs[event.pid].add(event.cap)
+        if event.tgid not in capablePIDs:
+            capablePIDs[event.tgid] = set()
+        capablePIDs[event.tgid].add(event.cap)
         print(capablePIDs)
 
     capableBPF['events'].open_perf_buffer(traceCaps)
-    while True:
-        try:
-            capableBPF.perf_buffer_poll()
-        except KeyboardInterrupt:
-            exit()
+    while runEvent.is_set():
+        capableBPF.perf_buffer_poll()
+    try:
+        while True:
+            pid = pidQueue.get(block=False)
+            containerProcesses.add(pid)
+    except queue.Empty:
+        for pid in containerProcesses:
+            print(pid)
+            if pid not in capablePIDs:
+                continue
+            for cap in capablePIDs[pid]:
+                print(capabilities[cap])
 
 if __name__ == '__main__':
     pidQueue = queue.Queue()
-    execsnoopTask = Thread(target=execsnoop, args=(pidQueue,))
-    capableTask = Thread(target=capable, args=(pidQueue,))
+    runEvent = Event()
+    runEvent.set()
+    execsnoopTask = Thread(target=execsnoop, args=(pidQueue,runEvent))
+    capableTask = Thread(target=capable, args=(pidQueue,runEvent))
 
     #Start the execsnoop and capable Threads; Sleep needed as otherwise there is a segmentation fault
     execsnoopTask.start()
-    time.sleep(1)
+    time.sleep(3)
     capableTask.start()
+
+    try:
+        while 1:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        runEvent.clear()
+        execsnoopTask.join()
+        capableTask.join()
