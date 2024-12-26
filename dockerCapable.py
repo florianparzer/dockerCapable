@@ -148,6 +148,7 @@ def capable(pidQueue, runEvent):
     def traceCaps(ctx, data, size):
         event = capableBPF['events'].event(data)
         if event.tgid not in capablePIDs:
+            #TODO only add pids to capable pid after runc(?)
             capablePIDs[event.tgid] = set()
         capablePIDs[event.tgid].add(event.cap)
         print(capablePIDs)
