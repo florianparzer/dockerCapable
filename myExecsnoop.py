@@ -218,5 +218,5 @@ while True:
             print('\nTraced container processes:\n')
             print(f'ContainerID: {containerID}')
             for proc in procs:
-                print(f'    {proc.pid}, {proc.command}, {proc.argv}')
+                print(f'    {proc.pid}{" ," + proc.command if proc.command != "" else ""}{", " + proc.argv if proc.argv != "" else ""}')
         exit()
