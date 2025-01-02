@@ -186,6 +186,12 @@ def printEvent(cpu, data, size):
 
 
 def addCloneProc2Container(containerID, event):
+    '''
+    Add a process that was created by clone to the containerID
+    :param containerID: The ContainerID to which the process belongs to
+    :param event: The event which contains the infos to the process
+    :return: None
+    '''
     try:
         with open(f'/sys/fs/cgroup/system.slice/docker-{containerID}.scope/cgroup.procs') as file:
             for line in file:
@@ -195,7 +201,7 @@ def addCloneProc2Container(containerID, event):
                 pid = int(line.strip())
                 with open(f'/proc/{pid}/status') as pidStatus:
                     #Look in the status file for the pid in the ns context
-                    for line2 in pidStatus:
+                    for line2 in pidStatus:#Problem here?
                         if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None:
                             #Check wheter the pid in ns context is the same as the return value of the syscall
                             if int(matcher.group(2)) == event.retval:
@@ -214,8 +220,8 @@ while True:
     try:
         b.perf_buffer_poll()
     except KeyboardInterrupt:
+        print('\nTraced container processes:\n')
         for containerID, procs in containerProcesses.items():
-            print('\nTraced container processes:\n')
             print(f'ContainerID: {containerID}')
             for proc in procs:
                 print(f'    {proc.pid}{" ," + proc.command if proc.command != "" else ""}{", " + proc.argv if proc.argv != "" else ""}')
