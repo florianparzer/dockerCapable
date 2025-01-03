@@ -180,7 +180,7 @@ def printEvent(cpu, data, size):
         if containerId is not None:
             containerProcesses[containerId].append(proc)
     elif event.type == EventType.CLONE_RET:
-        containerID, pProc = getProcessFromDict(event.ppid, containerProcesses)
+        containerID, pProc = getProcessFromDict(event.pid, containerProcesses)#Actually event.pid or event.ppid?
         if containerID is not None:
             addCloneProc2Container(containerID, event)
 
@@ -193,6 +193,7 @@ def addCloneProc2Container(containerID, event):
     :return: None
     '''
     try:
+        #print(event.pid, event.comm, event.ppid, event.retval)
         with open(f'/sys/fs/cgroup/system.slice/docker-{containerID}.scope/cgroup.procs') as file:
             for line in file:
                 proc = getProcessFromDict(int(line.strip()), containerProcesses)[1]
@@ -210,7 +211,7 @@ def addCloneProc2Container(containerID, event):
                                 containerProcesses[containerID].append(newProc)
                                 return
     except FileNotFoundError as e:
-        print(e.strerror)
+        containerProcesses[containerID].append(Process(event.retval, event.pid))
 
 
 # Print a header

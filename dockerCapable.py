@@ -2,8 +2,10 @@
 from bcc import BPF
 from threading import Thread
 from threading import Event
+from collections import defaultdict
 import queue
 import time
+import re
 
 capabilities = {
     0: "CAP_CHOWN",
@@ -49,37 +51,134 @@ capabilities = {
     40: "CAP_CHECKPOINT_RESTORE",
 }
 
+class EventType(object):
+    EXECVE_CALL = 0
+    EXECVE_RET = 1
+    CLONE_CALL = 2
+    CLONE_RET = 3
+
+class Process:
+    pid = None
+    command = ''
+    argv = ''
+    ppid = None
+    isTraced = True
+    _capabilities = set()
+
+    def __init__(self, pid:int, ppid:int, command='', arguments=''):
+        self.pid = pid
+        self.command = command
+        self.argv = arguments
+        self.ppid = ppid
+
+    def __eq__(self, __value):
+        if not isinstance(__value, Process):
+            return False
+        return self.pid == __value.pid
+
+    def addCap(self, cap:int):
+        self._capabilities.add(cap)
+
+    def getCaps(self):
+        return self._capabilities.copy()
+
+    def delCap(self, cap:int):
+        self._capabilities.remove(cap)
+
 def execsnoop(pidQueue, runEvent):
-    containerProcesses = []
     prog = '''
     #include <uapi/linux/ptrace.h> //needed? prob because of the task struct
     #include <linux/sched.h>
+    #include <linux/fs.h>
+
+    #define ARGSIZE  128
+
+    enum event_type {
+        EXECVE_CALL,
+        EXECVE_RET,
+        CLONE_CALL,
+        CLONE_RET
+    };
+
     //define the output struct
     struct data_t{
         u64 ts;
         u32 pid;
         u32 ppid;
         u32 uid;
+        enum event_type type;
         char comm[TASK_COMM_LEN];
         char pcomm[TASK_COMM_LEN];
+        char argv[ARGSIZE];
         int retval;
     };
     BPF_PERF_OUTPUT(events);
 
-    int printProcesses(struct pt_regs *ctx){
-        struct data_t data = {};
-        struct task_struct *task;
+    static int submit_arg(struct pt_regs *ctx, void *ptr, struct data_t *data){
+        const char *argp = NULL;
+        bpf_probe_read_user(&argp, sizeof(argp), ptr);
+        if (argp) {
+            bpf_probe_read_user(data->argv,sizeof(data->argv), argp);
+            events.perf_submit(ctx, data, sizeof(struct data_t));
+            return 1;
+        }
+        return 0;
+    }
 
+    static int collect_task_info(struct data_t *data){
+        struct task_struct *task;
         task = (struct task_struct *)bpf_get_current_task();
-        data.ts = bpf_ktime_get_ns();
+
+        data->ts = bpf_ktime_get_ns();
         //Is the pid (called in userspace thread-id) or the threadgroupid (called in userspace pid) needed
         //In this case rather the threadgroupid is needed therefore the result is shifted by 32 to the right because the pid is in the lower 32 bit and the threadgroupid in the upper 32 bit
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        data.ppid = task->real_parent->tgid;
-        data.uid = bpf_get_current_uid_gid();
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        data->pid = bpf_get_current_pid_tgid() >> 32;
+        data->ppid = task->real_parent->tgid;
+        data->uid = bpf_get_current_uid_gid();
+        bpf_get_current_comm(data->comm, sizeof(data->comm));
         //write the command of the parent process to data.pcmd
-        bpf_probe_read_kernel_str(&data.pcomm, sizeof(data.pcomm), task->real_parent->comm);
+        bpf_probe_read_kernel_str(data->pcomm, sizeof(data->pcomm), task->real_parent->comm);
+
+        return 0;
+    }
+
+
+    int syscall__execve(struct pt_regs *ctx,
+        const char __user *filename,
+        const char __user *const __user *__argv,
+        const char __user *const __user *__envp){
+        struct data_t data = {};
+        collect_task_info(&data);
+        data.retval = PT_REGS_RC(ctx);
+        data.type = EXECVE_CALL;
+
+        //Submit Filename as argument
+        bpf_probe_read_user(&data.argv, sizeof(data.argv), (void*)filename);
+        events.perf_submit(ctx, &data, sizeof(data));
+        //Submit up to 20 arguments
+        #pragma unroll
+        for(int i = 1; i < 20; i++){
+            if(submit_arg(ctx, (void *)&__argv[i], &data) == 0)
+                break;
+        }
+
+        return 0;
+    }
+
+    int ret_execve(struct pt_regs *ctx){
+        struct data_t data = {};
+        collect_task_info(&data);
+        data.type = EXECVE_RET;
+        data.retval = PT_REGS_RC(ctx);
+        events.perf_submit(ctx, &data, sizeof(data));
+
+        return 0;
+    }
+
+    int ret_clone(struct pt_regs *ctx){
+        struct data_t data = {};
+        collect_task_info(&data);
+        data.type = CLONE_RET;
         data.retval = PT_REGS_RC(ctx);
         events.perf_submit(ctx, &data, sizeof(data));
 
@@ -87,23 +186,30 @@ def execsnoop(pidQueue, runEvent):
     }
     '''
     execBPF = BPF(text=prog)
-    execBPF.attach_kretprobe(event=execBPF.get_syscall_fnname('execve'), fn_name='printProcesses')
+    execBPF.attach_kprobe(event=execBPF.get_syscall_fnname('execve'), fn_name='syscall__execve')
+    execBPF.attach_kretprobe(event=execBPF.get_syscall_fnname('execve'), fn_name='ret_execve')
+    execBPF.attach_kretprobe(event=execBPF.get_syscall_fnname('clone'), fn_name='ret_clone')
 
-    def sendPID(ctx, data, size):
+    argv = defaultdict(list)
+
+    def sendProc(ctx, data, size):
         event = execBPF['events'].event(data)
-        if event.comm == b'containerd-shim' or event.ppid in containerProcesses:
-            containerProcesses.append(event.pid)
-            pidQueue.put(event.pid)
+        if event.type == EventType.EXECVE_CALL:
+            argv[event.pid].append(event.argv)
+        elif event.type == EventType.EXECVE_RET:
+            argvText = b' '.join(argv[event.pid]).replace(b'\n', b'\\n').decode('ascii')
+            del (argv[event.pid])
+            pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid,
+                          event.pcomm.decode('ascii'), argvText))
+        elif event.type == EventType.CLONE_RET:
+            pidQueue.put(('proc', event.type, event.pid, event.ppid, event.retval))
 
-    execBPF['events'].open_perf_buffer(sendPID)
+    execBPF['events'].open_perf_buffer(sendProc)
     while runEvent.is_set():
         execBPF.perf_buffer_poll()
 
 
 def capable(pidQueue, runEvent):
-    #TODO Dictonary containing pid as key and a list of caps as value
-    capablePIDs = {}
-    containerProcesses = set()
     prog = '''
     #include <linux/sched.h>
     //define the output struct
@@ -147,26 +253,82 @@ def capable(pidQueue, runEvent):
 
     def traceCaps(ctx, data, size):
         event = capableBPF['events'].event(data)
-        if event.tgid not in capablePIDs:
-            #TODO only add pids to capable pid after runc(?)
-            capablePIDs[event.tgid] = set()
-        capablePIDs[event.tgid].add(event.cap)
-        print(capablePIDs)
+        pidQueue.put(('cap', event.tgid, event.cap))
 
     capableBPF['events'].open_perf_buffer(traceCaps)
     while runEvent.is_set():
         capableBPF.perf_buffer_poll()
+    exit(0)
+
+def getProcessFromDict(pid) -> (str, Process):
+    for containerID, procs in containerProcesses.items():
+        for proc in procs:
+            if proc.pid == pid:
+                return containerID, proc
+    return None, None
+
+def addCloneProc2Container(containerID, ppid, retval):
+    '''
+    Add a process that was created by clone to the containerID
+    :param containerID: The ContainerID to which the process belongs to
+    :param ppid: The parent pid for the new process
+    :param retval: The return value of the clone syscall aka the pid of the new process in context of the pid namespace
+    :return: None
+    '''
     try:
-        while True:
-            pid = pidQueue.get(block=False)
-            containerProcesses.add(pid)
-    except queue.Empty:
-        for pid in containerProcesses:
-            print(pid)
-            if pid not in capablePIDs:
+        with open(f'/sys/fs/cgroup/system.slice/docker-{containerID}.scope/cgroup.procs') as file:
+            for line in file:
+                proc = getProcessFromDict(int(line.strip()))[1]
+                if proc is not None:
+                    continue
+                pid = int(line.strip())
+                with open(f'/proc/{pid}/status') as pidStatus:
+                    #Look in the status file for the pid in the ns context
+                    for line2 in pidStatus:#Problem here?
+                        if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None:
+                            #Check wheter the pid in ns context is the same as the return value of the syscall
+                            if int(matcher.group(2)) == retval:
+                                #The new process has the pid of the event as ppid as in the clone syscall the return value is the new pid and the syscall caller is the parent
+                                newProc = Process(pid, ppid)
+                                containerProcesses[containerID].append(newProc)
+                                return
+    except FileNotFoundError as e:
+        containerProcesses[containerID].append(Process(retval, ppid))
+
+def addProc(msg):
+    eventType = msg[1]
+    if eventType == EventType.EXECVE_RET:
+        proc = Process(pid=msg[2], ppid=msg[4], command=msg[3], arguments=msg[6])
+        containerId, element = getProcessFromDict(proc.pid)
+        if element is not None:
+            element.command = proc.command
+            element.argv = proc.argv
+            return
+        if proc.command == 'containerd-shim' and (matcher := re.search('-id (\w+)(?:\s|^)', proc.argv)) is not None:
+            containerProcesses[matcher.group(1)].append(proc)
+            return
+        containerId, element = getProcessFromDict(proc.ppid)
+        # if (container, element := getProcessFromDict(event.ppid, containerProcesses))[1] is not None:
+        if containerId is not None:
+            containerProcesses[containerId].append(proc)
+    elif eventType == EventType.CLONE_RET:
+        retval = msg[4]
+        pid = msg[2]
+        containerID, pProc = getProcessFromDict(pid)
+        if containerID is not None:
+            addCloneProc2Container(containerID, ppid=pid, retval=retval)
+
+containerProcesses = defaultdict(list)
+
+def printCapabilities():
+    for containerID, procs in containerProcesses.items():
+        print(f'ContainerID: {containerID}')
+        for proc in procs:
+            if not proc.isTraced:
                 continue
-            for cap in capablePIDs[pid]:
-                print(capabilities[cap])
+            for cap in proc.getCaps():
+                print(f'    {capabilities[cap]}')
+
 
 if __name__ == '__main__':
     pidQueue = queue.Queue()
@@ -181,9 +343,18 @@ if __name__ == '__main__':
     capableTask.start()
 
     try:
-        while 1:
-            time.sleep(1)
+        while True:
+            msg = pidQueue.get()
+            if msg[0] == 'proc':
+                #print(msg)
+                addProc(msg)
+            elif msg[0] == 'cap':
+                pid = msg[1]
+                cap = msg[2]
+                if (proc := getProcessFromDict(pid)[1]) is not None:
+                    proc.addCap(cap)
     except KeyboardInterrupt:
         runEvent.clear()
+        printCapabilities()
         execsnoopTask.join()
         capableTask.join()
