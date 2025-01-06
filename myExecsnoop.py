@@ -180,39 +180,50 @@ def printEvent(cpu, data, size):
         if containerId is not None:
             containerProcesses[containerId].append(proc)
     elif event.type == EventType.CLONE_RET:
-        containerID, pProc = getProcessFromDict(event.pid, containerProcesses)#Actually event.pid or event.ppid?
+        timestamp = event.ts / 1000000000
+        printb(b"%-18.9f %-16s %-6d %-16s %-6d %-6d " % (
+            timestamp, event.comm, event.pid, event.pcomm, event.ppid, event.retval), nl='')
+        print('%-50s' % '')
+        containerID, pProc = getProcessFromDict(event.pid, containerProcesses)
         if containerID is not None:
-            addCloneProc2Container(containerID, event)
+            pProc.command = event.comm.decode('ascii')
+            pid = getGlobalPID(containerID, retval=event.retval)
+            #Check if pid could not be found or if process is already traced
+            if pid is None or getProcessFromDict(pid, containerProcesses)[0] is not None:
+                return
+            proc = Process(pid=pid, ppid=event.pid)
+            containerProcesses[containerID].append(proc)
 
 
-def addCloneProc2Container(containerID, event):
+def getGlobalPID(containerID, retval):
     '''
-    Add a process that was created by clone to the containerID
+    Returns the global PID for a PID in context of a certain container
     :param containerID: The ContainerID to which the process belongs to
-    :param event: The event which contains the infos to the process
-    :return: None
+    :param retval: The return value of the clone syscall aka the pid of the new process in context of the pid namespace
+    :return: integer value of the global pid
     '''
     try:
-        #print(event.pid, event.comm, event.ppid, event.retval)
         with open(f'/sys/fs/cgroup/system.slice/docker-{containerID}.scope/cgroup.procs') as file:
             for line in file:
+                #Check Processes in cgroup.procs file
                 proc = getProcessFromDict(int(line.strip()), containerProcesses)[1]
                 if proc is not None:
+                    #If process is already included in the list of container processes, skip it
                     continue
                 pid = int(line.strip())
-                with open(f'/proc/{pid}/status') as pidStatus:
-                    #Look in the status file for the pid in the ns context
-                    for line2 in pidStatus:#Problem here?
-                        if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None:
-                            #Check wheter the pid in ns context is the same as the return value of the syscall
-                            if int(matcher.group(2)) == event.retval:
-                                #The new process has the pid of the event as ppid as in the clone syscall the return value is the new pid and the syscall caller is the parent
-                                newProc = Process(pid, event.pid)
-                                containerProcesses[containerID].append(newProc)
-                                return
+                try:
+                    with open(f'/proc/{pid}/status') as pidStatus:
+                        #Look in the status file for the pid in the ns context
+                        for line2 in pidStatus:#Problem here?
+                            if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None and int(matcher.group(2)) == retval:
+                                #Check whether the pid in ns context is the same as the return value of the syscall
+                                return pid
+                except FileNotFoundError as err:
+                    print(f'Status file /proc/{pid}/status not found')
+                    return None
+        return retval
     except FileNotFoundError as e:
-        containerProcesses[containerID].append(Process(event.retval, event.pid))
-
+        return retval
 
 # Print a header
 print("%-18s %-16s %-6s %-16s %-6s %-6s %-50s" % ('TIME(s)', 'CMD', 'PID', 'Parent CMD', 'PPID', 'RETVAL', 'ARGV'))

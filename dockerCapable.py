@@ -62,14 +62,15 @@ class Process:
     command = ''
     argv = ''
     ppid = None
-    isTraced = True
+    isTraced = False
     _capabilities = set()
 
-    def __init__(self, pid:int, ppid:int, command='', arguments=''):
+    def __init__(self, pid:int, ppid:int, command='', arguments='', isTraces=False):
         self.pid = pid
         self.command = command
         self.argv = arguments
         self.ppid = ppid
+        self.isTraced = isTraces
 
     def __eq__(self, __value):
         if not isinstance(__value, Process):
@@ -202,7 +203,7 @@ def execsnoop(pidQueue, runEvent):
             pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid,
                           event.pcomm.decode('ascii'), argvText))
         elif event.type == EventType.CLONE_RET:
-            pidQueue.put(('proc', event.type, event.pid, event.ppid, event.retval))
+            pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid, event.retval))
 
     execBPF['events'].open_perf_buffer(sendProc)
     while runEvent.is_set():
@@ -267,33 +268,35 @@ def getProcessFromDict(pid) -> (str, Process):
                 return containerID, proc
     return None, None
 
-def addCloneProc2Container(containerID, ppid, retval):
+def getGlobalPID(containerID, retval):
     '''
-    Add a process that was created by clone to the containerID
+    Returns the global PID for a PID in context of a certain container
     :param containerID: The ContainerID to which the process belongs to
-    :param ppid: The parent pid for the new process
     :param retval: The return value of the clone syscall aka the pid of the new process in context of the pid namespace
-    :return: None
+    :return: integer value of the global pid
     '''
     try:
         with open(f'/sys/fs/cgroup/system.slice/docker-{containerID}.scope/cgroup.procs') as file:
             for line in file:
+                #Check Processes in cgroup.procs file
                 proc = getProcessFromDict(int(line.strip()))[1]
                 if proc is not None:
+                    #If process is already included in the list of container processes, skip it
                     continue
                 pid = int(line.strip())
-                with open(f'/proc/{pid}/status') as pidStatus:
-                    #Look in the status file for the pid in the ns context
-                    for line2 in pidStatus:#Problem here?
-                        if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None:
-                            #Check wheter the pid in ns context is the same as the return value of the syscall
-                            if int(matcher.group(2)) == retval:
-                                #The new process has the pid of the event as ppid as in the clone syscall the return value is the new pid and the syscall caller is the parent
-                                newProc = Process(pid, ppid)
-                                containerProcesses[containerID].append(newProc)
-                                return
+                try:
+                    with open(f'/proc/{pid}/status') as pidStatus:
+                        #Look in the status file for the pid in the ns context
+                        for line2 in pidStatus:#Problem here?
+                            if (matcher := re.match('NStgid:\s+(\d+)\s+(\d+)', line2)) is not None and int(matcher.group(2)) == retval:
+                            #Check whether the pid in ns context is the same as the return value of the syscall
+                                return pid
+                except FileNotFoundError as err:
+                    print(f'Status file /proc/{pid}/status not found')
+                    return None
     except FileNotFoundError as e:
-        containerProcesses[containerID].append(Process(retval, ppid))
+        return retval
+    return retval
 
 def addProc(msg):
     eventType = msg[1]
@@ -310,13 +313,24 @@ def addProc(msg):
         containerId, element = getProcessFromDict(proc.ppid)
         # if (container, element := getProcessFromDict(event.ppid, containerProcesses))[1] is not None:
         if containerId is not None:
+            if element.command == 'runc:[1:CHILD]':
+                proc.isTraced = True
             containerProcesses[containerId].append(proc)
     elif eventType == EventType.CLONE_RET:
-        retval = msg[4]
-        pid = msg[2]
-        containerID, pProc = getProcessFromDict(pid)
+        retval = msg[5]
+        ppid = msg[2]
+        pComm = msg[3]
+        #Chech wheter the parent process is included in the list
+        containerID, pProc = getProcessFromDict(ppid)
         if containerID is not None:
-            addCloneProc2Container(containerID, ppid=pid, retval=retval)
+            pProc.command = pComm
+            pid = getGlobalPID(containerID, retval=retval)
+            if pid is None or getProcessFromDict(pid)[0] is not None:
+                return
+            proc = Process(pid=pid, ppid=ppid)
+            if pProc.isTraced or pProc.command == 'runc:[1:CHILD]':
+                proc.isTraced = True
+            containerProcesses[containerID].append(proc)
 
 containerProcesses = defaultdict(list)
 
@@ -327,7 +341,7 @@ def printCapabilities():
             if not proc.isTraced:
                 continue
             for cap in proc.getCaps():
-                print(f'    {capabilities[cap]}')
+                print(f'    {proc.pid}:{proc.command}:{capabilities[cap]}')
 
 
 if __name__ == '__main__':
@@ -346,7 +360,6 @@ if __name__ == '__main__':
         while True:
             msg = pidQueue.get()
             if msg[0] == 'proc':
-                #print(msg)
                 addProc(msg)
             elif msg[0] == 'cap':
                 pid = msg[1]
