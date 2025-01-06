@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 from bcc import BPF
+from bcc import printb
 from threading import Thread
 from threading import Event
 from collections import defaultdict
@@ -58,12 +59,6 @@ class EventType(object):
     CLONE_RET = 3
 
 class Process:
-    pid = None
-    command = ''
-    argv = ''
-    ppid = None
-    isTraced = False
-    _capabilities = set()
 
     def __init__(self, pid:int, ppid:int, command='', arguments='', isTraces=False):
         self.pid = pid
@@ -71,6 +66,7 @@ class Process:
         self.argv = arguments
         self.ppid = ppid
         self.isTraced = isTraces
+        self._capabilities = set()
 
     def __eq__(self, __value):
         if not isinstance(__value, Process):
@@ -78,7 +74,8 @@ class Process:
         return self.pid == __value.pid
 
     def addCap(self, cap:int):
-        self._capabilities.add(cap)
+        if self.isTraced:
+            self._capabilities.add(cap)
 
     def getCaps(self):
         return self._capabilities.copy()
@@ -198,11 +195,17 @@ def execsnoop(pidQueue, runEvent):
         if event.type == EventType.EXECVE_CALL:
             argv[event.pid].append(event.argv)
         elif event.type == EventType.EXECVE_RET:
+            timestamp = event.ts / 1000000000
+            printb(b"%-18.9f %-16s %-6d %-16s %-6d %-6d " % (
+                timestamp, event.comm, event.pid, event.pcomm, event.ppid, event.retval), nl='\n')
             argvText = b' '.join(argv[event.pid]).replace(b'\n', b'\\n').decode('ascii')
             del (argv[event.pid])
             pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid,
                           event.pcomm.decode('ascii'), argvText))
         elif event.type == EventType.CLONE_RET:
+            timestamp = event.ts / 1000000000
+            printb(b"%-18.9f %-16s %-6d %-16s %-6d %-6d " % (
+                timestamp, event.comm, event.pid, event.pcomm, event.ppid, event.retval), nl='\n')
             pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid, event.retval))
 
     execBPF['events'].open_perf_buffer(sendProc)
@@ -338,10 +341,11 @@ def printCapabilities():
     for containerID, procs in containerProcesses.items():
         print(f'ContainerID: {containerID}')
         for proc in procs:
+            print(f'    {proc.pid}:{proc.command}:{proc.ppid}')
             if not proc.isTraced:
                 continue
             for cap in proc.getCaps():
-                print(f'    {proc.pid}:{proc.command}:{capabilities[cap]}')
+                print(f'        {capabilities[cap]}')
 
 
 if __name__ == '__main__':
