@@ -148,7 +148,7 @@ b.attach_kretprobe(event=b.get_syscall_fnname('clone'), fn_name='ret_clone')
 containerProcesses = defaultdict(list)
 argv = defaultdict(list)
 
-#TODO with execve it only shows new processes that are created with clone + execve, not the ones with only clone
+#With execve it only shows new processes that are created with clone + execve, not the ones with only clone
 #Can be traced with the retval of clone but this is only shows the pid inside the namespace; this can be converted to the host pid with looking at /proc/<pid>/status |grep NS
 #but it would need the pid of the host already, one could try to get the pids via pgrep -P <ppid> or ps --ppid <ppid>, where the ppid is the process that has the pid 1 in the namespace
 #

@@ -52,11 +52,15 @@ capabilities = {
     40: "CAP_CHECKPOINT_RESTORE",
 }
 
-class EventType(object):
+class TaskEventType(object):
     EXECVE_CALL = 0
     EXECVE_RET = 1
     CLONE_CALL = 2
     CLONE_RET = 3
+
+class CapEventType(object):
+    CAPABLE_CALL = 0
+    CAPABLE_RET = 1
 
 class Process:
 
@@ -192,9 +196,9 @@ def execsnoop(pidQueue, runEvent):
 
     def sendProc(ctx, data, size):
         event = execBPF['events'].event(data)
-        if event.type == EventType.EXECVE_CALL:
+        if event.type == TaskEventType.EXECVE_CALL:
             argv[event.pid].append(event.argv)
-        elif event.type == EventType.EXECVE_RET:
+        elif event.type == TaskEventType.EXECVE_RET:
             timestamp = event.ts / 1000000000
             printb(b"%-18.9f %-16s %-6d %-16s %-6d %-6d " % (
                 timestamp, event.comm, event.pid, event.pcomm, event.ppid, event.retval), nl='\n')
@@ -202,7 +206,7 @@ def execsnoop(pidQueue, runEvent):
             del (argv[event.pid])
             pidQueue.put(('proc', event.type, event.pid, event.comm.decode('ascii'), event.ppid,
                           event.pcomm.decode('ascii'), argvText))
-        elif event.type == EventType.CLONE_RET:
+        elif event.type == TaskEventType.CLONE_RET:
             timestamp = event.ts / 1000000000
             printb(b"%-18.9f %-16s %-6d %-16s %-6d %-6d " % (
                 timestamp, event.comm, event.pid, event.pcomm, event.ppid, event.retval), nl='\n')
@@ -216,14 +220,23 @@ def execsnoop(pidQueue, runEvent):
 def capable(pidQueue, runEvent):
     prog = '''
     #include <linux/sched.h>
+    #include <linux/cred.h>
+    
+    enum event_type {
+        CAPABLE_CALL,
+        CAPABLE_RET
+    };
+
     //define the output struct
     struct data_t{
         u32 tgid;
         u32 pid;
         u32 uid;
         int cap;
-        //int inEffective; //is 0 when cap is in effective set of task; Not possible as function is not called via kretprobe
+        enum event_type type;
         char comm[TASK_COMM_LEN];
+        int retval;
+        u64 caps;
     };
 
     BPF_PERF_OUTPUT(events);
@@ -232,15 +245,21 @@ def capable(pidQueue, runEvent):
 
     int traceCap(struct pt_regs *ctx, const struct cred *cred, struct user_namespace *targ_ns,
         int cap, unsigned int opts){
-        //bpf_trace_printk("Cap: %d\\n", cap);
-        //return 0;
         struct data_t data = {};
-
+        
+        //Get the Task struct and check whether the credentials where changed
+        //Used to filter for when the credentials are overwritten in kernelspace
+        //Will filter processes, that overwrite credentials in userspace too but will hardly happen in container
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        if(cred != task->real_cred){
+            return 0;
+        }
+        data.caps = cred->cap_permitted.val;
         data.pid = bpf_get_current_pid_tgid();
         data.tgid = bpf_get_current_pid_tgid() >> 32;
         data.uid = bpf_get_current_uid_gid();
         data.cap = cap;
-        //data.inEffective = PT_REGS_RC(ctx);
+        data.type = CAPABLE_CALL;
         bpf_get_current_comm(&data.comm, sizeof(data.comm));
 
         if(isTraces.lookup(&data) != NULL){
@@ -251,18 +270,51 @@ def capable(pidQueue, runEvent):
         events.perf_submit(ctx, &data, sizeof(data));
         return 0;
     }
+    
+    int traceRetCap(struct pt_regs *ctx){
+        struct data_t data = {};
+        
+        //Get the Task struct and check whether the credentials where changed
+        //Used to filter for when the credentials are overwritten in kernelspace
+        //Will filter processes, that overwrite credentials in userspace too but will hardly happen in container
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        if(task->cred != task->real_cred){
+            return 0;
+        }
+        data.pid = bpf_get_current_pid_tgid();
+        data.tgid = bpf_get_current_pid_tgid() >> 32;
+        data.uid = bpf_get_current_uid_gid();
+        data.type = CAPABLE_RET;
+        data.retval = PT_REGS_RC(ctx);
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        
+        events.perf_submit(ctx, &data, sizeof(data));
+        return 0;
+    }
     '''
     capableBPF = BPF(text=prog)
     capableBPF.attach_kprobe(event='cap_capable', fn_name='traceCap')
+    capableBPF.attach_kretprobe(event='cap_capable', fn_name='traceRetCap')
+
+    tracedCaps = defaultdict(int)
 
     def traceCaps(ctx, data, size):
         event = capableBPF['events'].event(data)
-        pidQueue.put(('cap', event.tgid, event.cap))
+        if event.type == CapEventType.CAPABLE_CALL:
+            if traceFailed:
+                pidQueue.put(('cap', event.tgid, event.cap))
+            else:
+                tracedCaps[event.tgid] = event.cap
+        else:
+            if not traceFailed and event.retval == 0 and event.tgid in tracedCaps:
+                pidQueue.put(('cap', event.tgid, tracedCaps[event.tgid]))
+                del(tracedCaps[event.tgid])
 
     capableBPF['events'].open_perf_buffer(traceCaps)
     while runEvent.is_set():
         capableBPF.perf_buffer_poll()
     exit(0)
+
 
 def getProcessFromDict(pid) -> (str, Process):
     for containerID, procs in containerProcesses.items():
@@ -302,8 +354,13 @@ def getGlobalPID(containerID, retval):
     return retval
 
 def addProc(msg):
+    '''
+    Adds a Process to the containerProcesses
+    :param msg: The message from the thread containing the process information
+    :return: None
+    '''
     eventType = msg[1]
-    if eventType == EventType.EXECVE_RET:
+    if eventType == TaskEventType.EXECVE_RET:
         proc = Process(pid=msg[2], ppid=msg[4], command=msg[3], arguments=msg[6])
         containerId, element = getProcessFromDict(proc.pid)
         if element is not None:
@@ -319,11 +376,11 @@ def addProc(msg):
             if element.command == 'runc:[1:CHILD]':
                 proc.isTraced = True
             containerProcesses[containerId].append(proc)
-    elif eventType == EventType.CLONE_RET:
+    elif eventType == TaskEventType.CLONE_RET:
         retval = msg[5]
         ppid = msg[2]
         pComm = msg[3]
-        #Chech wheter the parent process is included in the list
+        #Check whether the parent process is included in the list
         containerID, pProc = getProcessFromDict(ppid)
         if containerID is not None:
             pProc.command = pComm
@@ -331,22 +388,23 @@ def addProc(msg):
             if pid is None or getProcessFromDict(pid)[0] is not None:
                 return
             proc = Process(pid=pid, ppid=ppid)
-            if pProc.isTraced or pProc.command == 'runc:[1:CHILD]':
+            if pid != retval or pProc.isTraced or pProc.command == 'runc:[1:CHILD]':
                 proc.isTraced = True
             containerProcesses[containerID].append(proc)
-
-containerProcesses = defaultdict(list)
 
 def printCapabilities():
     for containerID, procs in containerProcesses.items():
         print(f'ContainerID: {containerID}')
         for proc in procs:
-            print(f'    {proc.pid}:{proc.command}:{proc.ppid}')
+            print(f'    {proc.pid}:{proc.command}:{proc.ppid}:{proc.isTraced}')
             if not proc.isTraced:
                 continue
             for cap in proc.getCaps():
                 print(f'        {capabilities[cap]}')
 
+containerProcesses = defaultdict(list)
+#Variable to control whether to trace capabilities which failed the check in cap_capable
+traceFailed = True
 
 if __name__ == '__main__':
     pidQueue = queue.Queue()
