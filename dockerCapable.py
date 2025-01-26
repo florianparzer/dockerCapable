@@ -396,7 +396,7 @@ def printCapabilities():
     for containerID, procs in containerProcesses.items():
         print(f'ContainerID: {containerID}')
         for proc in procs:
-            print(f'    {proc.pid}:{proc.command}:{proc.ppid}:{proc.isTraced}')
+            #print(f'    {proc.pid}:{proc.command}:{proc.ppid}:{proc.isTraced}')
             if not proc.isTraced:
                 continue
             for cap in proc.getCaps():
